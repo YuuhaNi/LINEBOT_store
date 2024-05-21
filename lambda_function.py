@@ -5,7 +5,7 @@ import os
 import urllib.request
 import time
 from linebot import LineBotApi
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -16,9 +16,11 @@ dynamodb = boto3.resource('dynamodb')
 table_name = os.environ['TABLE_NAME']  # 環境変数からテーブル名を取得
 table = dynamodb.Table(table_name)
 
-line_bot_api = LineBotApi(os.environ["CHANNEL_ACCESS_TOKEN"])  # 環境変数からCHANNEL_ACCESS_TOKENを取得
+line_bot_api = LineBotApi(os.environ["CHANNEL_ACCESS_TOKEN"])
 
 s3 = boto3.client('s3')
+rekognition = boto3.client('rekognition')
+model_arn = os.environ['REKOGNITION_MODEL_ARN']   # カスタムラベルモデルのARN
 
 # テーブルスキャン
 def operation_scan():
@@ -97,29 +99,44 @@ def lambda_handler(event, context):
                 message_content = line_bot_api.get_message_content(message_event["message"]["id"])
                 image_data = message_content.content
                 
-                date = datetime.fromtimestamp(timestamp).strftime('%y-%m-%d-%H-%M-%S')  # 日時の形式を変更
-                file_name = f"{display_name}/{date}.jpg"  # ファイル名の形式を表示名/日時.jpgに変更
+                # 日本時間を取得
+                jp_time = datetime.utcfromtimestamp(timestamp) + timedelta(hours=9)
+                date = jp_time.strftime('%y-%m-%d-%H-%M-%S')  # 日時の形式を変更
+                file_name = f"{date}.jpg"  # ファイル名の形式を日時.jpgに変更
                 bucket_name = os.environ['BUCKET_NAME']  # 環境変数からバケット名を取得
                 
+                # 画像をS3バケットに保存
                 s3.put_object(Bucket=bucket_name, Key=file_name, Body=image_data)
+                
+                # 画像の分類
+                response = rekognition.detect_custom_labels(
+                    Image={'S3Object': {'Bucket': bucket_name, 'Name': file_name}},
+                    ProjectVersionArn=model_arn
+                )
+                
+                # 分類結果の取得
+                labels = response['CustomLabels']
+                if len(labels) > 0:
+                    top_label = labels[0]['Name']
+                    confidence = labels[0]['Confidence']
+                    reply_text = f"画像の分類結果: {top_label} (信頼度: {confidence:.2f}%)"
+                else:
+                    reply_text = "画像の分類結果: その他"
                 
                 image_url = f"https://{bucket_name}.s3.amazonaws.com/{file_name}"
                 operation_put(user_id, timestamp, display_name, None, image_url)
-                
-                reply_text = "画像が保存されたよ！"
             else:
                 # テキストメッセージの処理
                 message_text = message_event["message"]["text"]
                 operation_put(user_id, timestamp, display_name, message_text)
-                
                 reply_text = f"表示名: {display_name}, メッセージ: {message_text}"
             
+            # 分類結果をLINEで返信
             url = "https://api.line.me/v2/bot/message/reply"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": "Bearer " + os.environ["CHANNEL_ACCESS_TOKEN"]
             }
-            
             data = {
                 "replyToken": message_event["replyToken"],
                 "messages": [
@@ -129,9 +146,7 @@ def lambda_handler(event, context):
                     }
                 ]
             }
-            
             req = urllib.request.Request(url=url, data=json.dumps(data).encode("utf-8"), method="POST", headers=headers)
-            
             with urllib.request.urlopen(req) as res:
                 logger.info(res.read().decode("utf-8"))
                 return {
